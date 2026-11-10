@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Capture exported values before launcher globals or Bash locals can shadow them.
+# Reserve _AGENTS_* for this snapshot and its restoration machinery.
+mapfile -d '' -t _AGENTS_ORIGINAL_ENV < <(env -0)
+RUN_ENV_EXPORTS=()
+
+IMAGE="${CODEX_ISOLATED_IMAGE:-localhost/codex-one-folder}"
+STATE_VOLUME="${CODEX_ISOLATED_STATE_VOLUME:-codex-state}"
+RUN_CONTAINER_NAME="${CODEX_ISOLATED_CONTAINER_NAME:-}"
+LOGIN_CONTAINER_NAME="${CODEX_ISOLATED_LOGIN_CONTAINER_NAME:-codex-isolated-login}"
+RUN_ENV_ARGS=()
+ENV_NAMES=()
+SECRET_NAMES=()
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  codex-isolated [--env NAME] [--secret-env VARIABLE=SECRET_NAME] [run] [CODEX_ARGS...]
+  codex-isolated login
+  codex-isolated auth-status
+  codex-isolated logout
+  codex-isolated verify
+  codex-isolated version
+  codex-isolated help
+
+Run mode mounts only the current Git repository at /workspaces/<name>-<id> and the
+persistent Codex state volume at /state. Different repositories may run
+concurrently; each repository permits one isolated agent session at a time.
+
+Environment options are repeatable and must precede run/Codex arguments.
+--env forwards an exported host variable by name; --secret-env supplies a
+Podman secret as a container environment variable. Neither accepts token values.
+Use run or -- to end launcher option parsing. Helpers receive no selected variables.
+USAGE
+}
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command '$1' is not installed"
+}
+
+register_env_name() {
+  local name="$1" existing
+  [[ "$name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || fail "invalid environment variable name"
+  case "$name" in
+    HOME|CODEX_HOME)
+      fail "'$name' is reserved for the Codex container configuration" ;;
+  esac
+  [[ "$name" != _AGENTS_* ]] || fail "environment names beginning _AGENTS_ are reserved"
+  for existing in "${ENV_NAMES[@]}"; do
+    [[ "$existing" != "$name" ]] || fail "environment variable '$name' was selected more than once"
+  done
+  ENV_NAMES+=("$name")
+}
+
+select_host_env() {
+  for _AGENTS_ENTRY in "${_AGENTS_ORIGINAL_ENV[@]}"; do
+    if [[ "${_AGENTS_ENTRY%%=*}" == "$1" ]]; then
+      RUN_ENV_EXPORTS+=("$_AGENTS_ENTRY")
+      return
+    fi
+  done
+  fail "environment variable '$1' is not exported"
+}
+
+run_selected_podman() (
+  # Shell builtins restore values without putting secrets in a process argv.
+  # Arguments have already been expanded before any selected name is restored.
+  for _AGENTS_ENTRY in "${RUN_ENV_EXPORTS[@]}"; do
+    _AGENTS_KEY="${_AGENTS_ENTRY%%=*}"
+    if [[ "$(declare -p "$_AGENTS_KEY" 2>/dev/null || :)" =~ ^declare\ -[^[:space:]]*r ]]; then
+      [[ "${!_AGENTS_KEY}" == "${_AGENTS_ENTRY#*=}" ]] \
+        || fail "cannot restore changed readonly Bash variable '$_AGENTS_KEY'"
+      export "${_AGENTS_KEY?}"
+    else
+      # Globals may be arrays now; reset their type before restoring a scalar.
+      unset "$_AGENTS_KEY"
+      export "${_AGENTS_ENTRY?}"
+    fi
+  done
+  exec podman "$@"
+)
+
+lock_workspace() {
+  local lock_dir lock_id active
+  require_command flock
+  require_command sha256sum
+  lock_dir="${XDG_RUNTIME_DIR:-/tmp}/agents-podman-${UID}"
+  (umask 077; mkdir -p -- "$lock_dir")
+  [[ -d "$lock_dir" && ! -L "$lock_dir" && -O "$lock_dir" ]] \
+    || fail "unsafe workspace lock directory '$lock_dir'"
+  lock_id="$(printf '%s' "$1" | sha256sum)"
+  # fd 9 is deliberately inherited by Podman so the lock lasts for the session.
+  exec 9>"$lock_dir/${lock_id%% *}.lock"
+  if ! flock -n 9; then
+    active="$(podman ps --filter "label=io.agents-podman.workspace=${lock_id%% *}" \
+      --filter status=running --format '{{.Names}}')"
+    [[ -z "$active" ]] || running_session_error "$active"
+    fail "this repository is already in use by an isolated agent (possibly starting); wait for it or stop that session before launching another"
+  fi
+  _AGENTS_WORKSPACE_ID="${lock_id%% *}"
+  # Detached containers can outlive their launcher and its lock.
+  active="$(podman ps --filter "label=io.agents-podman.workspace=$_AGENTS_WORKSPACE_ID" \
+    --filter status=running --format '{{.Names}}')"
+  [[ -z "$active" ]] || running_session_error "$active"
+  # The launcher holds fd 9 while waiting for Podman. Never delete lock files:
+  # unlinking a lock file could allow two processes to lock different inodes.
+}
+
+git_metadata_digest() {
+  # Hooks and Git config run on the host during later Git commands. Hash file
+  # contents, and record types/modes/link targets without following links.
+  { find "$1/.git/config" "$1/.git/config.worktree" "$1/.git/hooks" \
+      -printf '%y %m %p %l\n' -type f -exec sha256sum -- {} + 2>/dev/null || :; } \
+    | LC_ALL=C sort | sha256sum
+}
+
+warn_if_git_metadata_changed() {
+  [[ "$(git_metadata_digest "$1")" == "$2" ]] && return
+  printf 'Warning: the session changed .git/config or .git/hooks in %s.\n' "$1" >&2
+  printf 'Review them before running Git on the host; they can execute host commands.\n' >&2
+}
+
+parse_env_options() {
+  local name secret
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --env)
+        [[ $# -ge 2 ]] || fail "--env requires NAME"
+        name="$2"
+        register_env_name "$name"
+        select_host_env "$name"
+        RUN_ENV_ARGS+=(--env "$name")
+        shift 2
+        ;;
+      --secret-env)
+        [[ $# -ge 2 && "$2" == *=* ]] || fail "--secret-env requires VARIABLE=SECRET_NAME"
+        name="${2%%=*}"
+        secret="${2#*=}"
+        register_env_name "$name"
+        [[ "$secret" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail "invalid Podman secret name"
+        RUN_ENV_ARGS+=(--secret "${secret},type=env,target=${name}")
+        SECRET_NAMES+=("$secret")
+        shift 2
+        ;;
+      *) break ;;
+    esac
+  done
+  main_command "$@"
+}
+
+check_rootless() {
+  local rootless
+  rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+  [[ "$rootless" == "true" ]] || fail "Podman must be run rootless as your normal user"
+}
+
+check_image_and_state() {
+  podman image exists "$IMAGE" || fail "image '$IMAGE' does not exist; run install.sh first"
+  podman volume exists "$STATE_VOLUME" || fail "state volume '$STATE_VOLUME' does not exist; run install.sh first"
+}
+
+running_session_error() {
+  local name
+  printf 'Error: an isolated session is already running in container(s):\n\n%s\n' "$1" >&2
+  while IFS= read -r name; do
+    printf '\nAttach to it with:\n  podman attach %q\n\nStop it with:\n  podman stop %q\n' "$name" "$name" >&2
+  done <<< "$1"
+  exit 1
+}
+
+repository_identity() {
+  local repo_name repo_hash
+  require_command sha256sum
+  repo_hash="$(printf '%s' "$1" | sha256sum)"
+  repo_name="$(printf '%s' "${1##*/}" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '-')"
+  printf '%s-%s\n' "${repo_name:0:48}" "${repo_hash:0:16}"
+}
+
+repository_container_name() {
+  printf 'codex-isolated-%s\n' "$(repository_identity "$1")"
+}
+
+cleanup_stale_container() {
+  local name="$1"
+  if podman container exists "$name"; then
+    if [[ "$(podman inspect --format '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]; then
+      running_session_error "$name"
+    fi
+    podman rm "$name" >/dev/null
+  fi
+}
+
+workspace_root() {
+  local root home_real
+
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || fail "current directory is not inside a Git working tree"
+
+  root="$(git rev-parse --show-toplevel)"
+  root="$(realpath -e -- "$root")"
+  home_real="$(realpath -e -- "$HOME")"
+
+  [[ "$root" != "/" ]] || fail "refusing to mount the filesystem root"
+  [[ "$home_real/" != "$root/"* ]] || fail "refusing to mount your home directory or one of its parents"
+  [[ "$root" != *$'\n'* && "$root" != *$'\r'* ]] \
+    || fail "workspace paths containing line breaks are not supported"
+  [[ "$root" != *","* ]] || fail "workspace paths containing commas are not supported"
+
+  printf '%s\n' "$root"
+}
+
+run_codex() {
+  local workspace secret container_workspace git_before status=0
+  workspace="$(workspace_root)"
+  # Linked worktrees and external Git dirs cannot work with a root-only mount.
+  [[ -d "$workspace/.git" && ! -L "$workspace/.git" ]] \
+    || fail "linked worktrees, submodule roots, and external Git directories are not supported; use a standalone clone"
+
+  container_workspace="/workspaces/$(repository_identity "$workspace")"
+
+  for secret in "${SECRET_NAMES[@]}"; do
+    podman secret exists "$secret" || fail "Podman secret '$secret' is unavailable; create it on the host first"
+  done
+
+  [[ -n "$RUN_CONTAINER_NAME" ]] || RUN_CONTAINER_NAME="$(repository_container_name "$workspace")"
+  lock_workspace "$workspace"
+  cleanup_stale_container "$RUN_CONTAINER_NAME"
+
+  printf 'Workspace: %s\nContainer: %s\n' "$workspace" "$RUN_CONTAINER_NAME" >&2
+  git_before="$(git_metadata_digest "$workspace")"
+
+  run_selected_podman run --rm -it \
+    --name "$RUN_CONTAINER_NAME" \
+    --label "io.agents-podman.workspace=$_AGENTS_WORKSPACE_ID" \
+    --label io.agents-podman.agent=codex \
+    --http-proxy=false \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    --mount "type=bind,src=${workspace},dst=${container_workspace},relabel=private,bind-nonrecursive" \
+    --mount "type=volume,src=${STATE_VOLUME},dst=/state" \
+    --workdir "$container_workspace" \
+    "${RUN_ENV_ARGS[@]}" \
+    "$IMAGE" \
+    --no-daemon \
+    --dangerously-bypass-approvals-and-sandbox \
+    "$@" || status=$?
+  warn_if_git_metadata_changed "$workspace" "$git_before"
+  return "$status"
+}
+
+login_codex() {
+  cleanup_stale_container "$LOGIN_CONTAINER_NAME"
+
+  exec podman run --rm -it \
+    --name "$LOGIN_CONTAINER_NAME" \
+    --label io.agents-podman.agent=codex \
+    --network=host \
+    --http-proxy=false \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    --mount "type=volume,src=${STATE_VOLUME},dst=/state" \
+    "$IMAGE" login
+}
+
+auth_status() {
+  podman run --rm \
+    --http-proxy=false \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    --mount "type=volume,src=${STATE_VOLUME},dst=/state" \
+    "$IMAGE" login status
+}
+
+logout_codex() {
+  podman run --rm -it \
+    --http-proxy=false \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    --mount "type=volume,src=${STATE_VOLUME},dst=/state" \
+    "$IMAGE" logout
+}
+
+show_version() {
+  podman run --rm \
+    --http-proxy=false \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    "$IMAGE" --version
+}
+
+verify_setup() {
+  local rootless enforcing privileged caps security_opts workspace=""
+
+  printf 'Checking Podman...\n'
+  rootless="$(podman info --format '{{.Host.Security.Rootless}}')"
+  [[ "$rootless" == "true" ]] || fail "Podman is not rootless"
+  printf '  rootless: true\n'
+
+  printf 'Checking image and state volume...\n'
+  podman image exists "$IMAGE" || fail "image '$IMAGE' is missing"
+  podman volume exists "$STATE_VOLUME" || fail "state volume '$STATE_VOLUME' is missing"
+  printf '  image: %s\n' "$IMAGE"
+  printf '  state volume: %s\n' "$STATE_VOLUME"
+
+  if command -v getenforce >/dev/null 2>&1; then
+    enforcing="$(getenforce)"
+    printf '  SELinux: %s\n' "$enforcing"
+    if [[ "$enforcing" != "Enforcing" ]]; then
+      printf 'Warning: SELinux is not enforcing; filesystem isolation still relies on Podman namespaces, but defense in depth is reduced.\n' >&2
+    fi
+  fi
+
+  printf 'Checking Codex image...\n'
+  show_version
+
+  printf 'Checking authentication status...\n'
+  if ! auth_status; then
+    printf 'Warning: Codex is not authenticated yet. Run: codex-isolated login\n' >&2
+  fi
+
+  printf '\nStatic security properties used by run mode:\n'
+  printf '  privileged: false (default)\n'
+  printf '  capabilities: all dropped\n'
+  printf '  no-new-privileges: enabled\n'
+  printf '  workspace: current Git root only\n'
+  printf '  bind mount: private SELinux relabel + non-recursive\n'
+  printf '  persistent host data: Codex state volume only\n'
+  printf '  host environment: only explicitly selected variables/secrets in run mode\n'
+  printf '  SSH agent/container socket: not mounted or forwarded\n'
+
+  if [[ -z "$RUN_CONTAINER_NAME" ]]; then
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      workspace="$(workspace_root)"
+      RUN_CONTAINER_NAME="$(repository_container_name "$workspace")"
+    else
+      printf '\nRun verify inside a Git repository for live-container checks.\n'
+      return
+    fi
+  fi
+
+  if podman container exists "$RUN_CONTAINER_NAME" \
+    && [[ "$(podman inspect --format '{{.State.Running}}' "$RUN_CONTAINER_NAME")" == "true" ]]; then
+    printf '\nChecking running container %s...\n' "$RUN_CONTAINER_NAME"
+
+    privileged="$(podman inspect --format '{{.HostConfig.Privileged}}' "$RUN_CONTAINER_NAME")"
+    [[ "$privileged" == "false" ]] || fail "running container is privileged"
+
+    caps="$(podman inspect --format '{{.EffectiveCaps}}/{{.BoundingCaps}}' "$RUN_CONTAINER_NAME")"
+    [[ "$caps" == "[]/[]" ]] || fail "running container has effective or bounding capabilities: $caps"
+
+    security_opts="$(podman inspect --format '{{.HostConfig.SecurityOpt}}' "$RUN_CONTAINER_NAME")"
+    [[ "$security_opts" == *"no-new-privileges"* ]] \
+      || fail "running container is missing no-new-privileges"
+
+    require_command python3
+    podman inspect "$RUN_CONTAINER_NAME" | python3 -I -c '
+import hashlib, json, os, re, sys
+container = json.load(sys.stdin)[0]
+mounts = container["Mounts"]
+assert len(mounts) == 2, "expected exactly two mounts"
+state = [m for m in mounts if m["Destination"] == "/state"][0]
+workspaces = [m for m in mounts if re.fullmatch(r"/workspaces/[A-Za-z0-9_.-]+-[0-9a-f]{16}", m["Destination"])]
+assert len(workspaces) == 1, "unexpected workspace destination"
+workspace = workspaces[0]
+assert state["Type"] == "volume" and state["Name"] == sys.argv[1], "unexpected state volume"
+assert workspace["Type"] == "bind", "workspace is not a bind mount"
+assert container["Config"]["WorkingDir"] == workspace["Destination"], "unexpected working directory"
+source = workspace["Source"]
+# Match the launcher byte-wise sanitization and canonical host path identity.
+name = re.sub(rb"[^A-Za-z0-9_.-]", b"-", os.fsencode(os.path.basename(source)))[:48].decode("ascii")
+expected = "/workspaces/" + name + "-" + hashlib.sha256(os.fsencode(source)).hexdigest()[:16]
+assert workspace["Destination"] == expected, "workspace identity does not match its source"
+assert not sys.argv[2] or source == sys.argv[2], "workspace does not match the selected repository"
+home = os.path.realpath(os.path.expanduser("~"))
+assert os.path.realpath(source) == source and source != "/" and not (home + "/").startswith(source + "/"), "unsafe workspace source"
+assert os.path.isdir(os.path.join(source, ".git")) and not os.path.islink(os.path.join(source, ".git")), "workspace has external Git metadata"
+print("  privileged: false")
+print("  effective/bounding capabilities: empty")
+print("  no-new-privileges: present")
+print("  workspace source: " + source)
+print("  workspace destination: " + workspace["Destination"])
+print("  state volume: " + sys.argv[1])
+' "$STATE_VOLUME" "$workspace"
+    printf '  labels: '
+    podman inspect --format 'process={{.ProcessLabel}} mount={{.MountLabel}}' "$RUN_CONTAINER_NAME"
+  else
+    printf '\nNo running %s container found; live-container checks skipped.\n' "$RUN_CONTAINER_NAME"
+  fi
+}
+
+main() {
+  parse_env_options "$@"
+}
+
+main_command() {
+  case "${1:-}" in
+    help|-h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+
+  case "${1:-}" in
+    login|auth-status|logout|verify|version)
+      [[ ${#RUN_ENV_ARGS[@]} -eq 0 ]] || fail "environment options apply only to run mode"
+      ;;
+  esac
+
+  require_command podman
+  require_command git
+  require_command realpath
+  check_rootless
+  check_image_and_state
+
+  case "${1:-}" in
+    login)
+      shift
+      [[ $# -eq 0 ]] || fail "'login' takes no additional arguments"
+      login_codex
+      ;;
+    auth-status)
+      shift
+      [[ $# -eq 0 ]] || fail "'auth-status' takes no additional arguments"
+      auth_status
+      ;;
+    logout)
+      shift
+      [[ $# -eq 0 ]] || fail "'logout' takes no additional arguments"
+      logout_codex
+      ;;
+    verify)
+      shift
+      [[ $# -eq 0 ]] || fail "'verify' takes no additional arguments"
+      verify_setup
+      ;;
+    version)
+      shift
+      [[ $# -eq 0 ]] || fail "'version' takes no additional arguments"
+      show_version
+      ;;
+    run)
+      shift
+      run_codex "$@"
+      ;;
+    --)
+      shift
+      run_codex "$@"
+      ;;
+    *)
+      run_codex "$@"
+      ;;
+  esac
+}
+
+main "$@"

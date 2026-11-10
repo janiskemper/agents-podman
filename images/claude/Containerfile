@@ -1,0 +1,31 @@
+FROM docker.io/library/debian:bookworm-slim
+
+ARG CLAUDE_VERSION
+# Supplied by install.sh, which owns the minimum supported version.
+ARG CLAUDE_MIN_VERSION
+LABEL org.opencontainers.image.title="claude-podman-isolated" \
+      org.opencontainers.image.description="Claude Code in a rootless Podman container" \
+      org.opencontainers.image.version="${CLAUDE_VERSION}"
+
+RUN test -n "$CLAUDE_VERSION" && test -n "$CLAUDE_MIN_VERSION" \
+    && test "$(printf '%s\n' "$CLAUDE_MIN_VERSION" "$CLAUDE_VERSION" | sort -V | head -n 1)" = "$CLAUDE_MIN_VERSION" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates curl gh git jq less openssh-client \
+        procps python3 ripgrep zstd \
+    && curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+    && bash /tmp/claude-install.sh "$CLAUDE_VERSION" \
+    && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+    && test "$(claude --version)" = "$CLAUDE_VERSION (Claude Code)" \
+    && rm -rf /tmp/claude-install.sh /root/.claude /root/.local /root/.cache /var/lib/apt/lists/*
+
+COPY images/claude/entrypoint.sh /usr/local/bin/claude-container-entrypoint
+RUN chmod 0755 /usr/local/bin/claude-container-entrypoint \
+    && mkdir -p /state/claude /workspaces
+
+# HOME remains the disposable image home. Only Claude-specific state persists.
+ENV CLAUDE_CONFIG_DIR=/state/claude
+ENV DISABLE_AUTOUPDATER=1
+ENV DISABLE_UPDATES=1
+WORKDIR /workspaces
+ENTRYPOINT ["/usr/local/bin/claude-container-entrypoint"]
